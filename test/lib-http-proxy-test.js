@@ -5,7 +5,8 @@ var httpProxy = require('../lib/http-proxy'),
     ws        = require('ws'),
     io        = require('socket.io'),
     SSE       = require('sse'),
-    ioClient  = require('socket.io-client');
+    ioClient  = require('socket.io-client'),
+    delay = require('await-delay');
 
 //
 // Expose a port number generator.
@@ -29,7 +30,7 @@ describe('lib/http-proxy.js', function() {
       }
 
       expect(error).to.be.an(Error);
-    })
+    });
 
     it('should return an object otherwise', function() {
       var obj = httpProxy.createProxyServer({
@@ -352,6 +353,60 @@ describe('lib/http-proxy.js', function() {
       });
     });
 
+    it('should proxy the websockets stream, with an incoming and outgoing transform stream', function (done) {
+      var ports = { source: gen.port, proxy: gen.port };
+      var proxy = httpProxy.createProxyServer({
+        target: {
+          host: '127.0.0.1',
+          port: ports.source
+        },
+        wsTransform : {
+          incoming:(message) => {
+            return message.toUpperCase();
+          },
+          outgoing:(message) => {
+            return message.toUpperCase();
+          }
+        }
+      });
+
+      var proxyServer = http.createServer(function (req, res) {
+        proxy.web(req, res);
+      });
+      //
+      // Listen to the `upgrade` event and proxy the
+      // WebSocket requests as well.
+      //
+      proxyServer.on('upgrade', function (req, socket, head) {
+        proxy.ws(req, socket, head);
+      });
+
+      proxyServer.listen(ports.proxy);
+
+      var destiny = new ws.Server({ port: ports.source }, function () {
+        var client = new ws('ws://127.0.0.1:' + ports.proxy);
+
+        client.on('open', function () {
+          client.send('hello there');
+        });
+
+        client.on('message', function (msg) {
+          expect(msg).to.be('HELLO OVER WEBSOCKETS');
+          client.close();
+          proxyServer.close();
+          destiny.close();
+          done();
+        });
+      });
+
+      destiny.on('connection', function (socket) {
+        socket.on('message', function (msg) {
+          expect(msg).to.be('HELLO THERE');
+          socket.send('Hello over websockets');
+        });
+      });
+    });
+
     it('should emit error on proxy error', function (done) {
       var ports = { source: gen.port, proxy: gen.port };
       var proxy = httpProxy.createProxyServer({
@@ -362,7 +417,7 @@ describe('lib/http-proxy.js', function() {
       proxyServer = proxy.listen(ports.proxy),
       client = new ws('ws://127.0.0.1:' + ports.proxy);
 
-      client.on('open', function () {
+      client.on('open', async () => {
         client.send('hello there');
       });
 
@@ -428,10 +483,10 @@ describe('lib/http-proxy.js', function() {
       }),
       proxyServer = proxy.listen(ports.proxy),
       server = http.createServer(),
-      destiny = io.listen(server);
+      destiny = io.listen(server, {transports: ['websocket']});
 
       function startSocketIo() {
-        var client = ioClient.connect('ws://127.0.0.1:' + ports.proxy);
+        var client = ioClient.connect('ws://127.0.0.1:' + ports.proxy, {transports: ['websocket']});
 
         client.on('connect', function () {
           client.emit('incoming', 'hello there');
@@ -455,6 +510,68 @@ describe('lib/http-proxy.js', function() {
       })
     });
 
+    it('should proxy a socket.io stream, with transform streams', function (done) {
+      this.timeout(10000);
+
+      //socket.io is not a pure implementation of ws, so some wierdness
+      //we need to wait for the upgrade event, and outgoing transforms dont work
+
+      var ports = { source: gen.port, proxy: gen.port };
+      var proxy = httpProxy.createProxyServer({
+        ws : true,
+        wsTransform : {
+          incoming:(message) => {
+            return message.replace("hello there", "HELLO THERE");
+          }
+        }
+      });
+
+      var server = require('http').createServer(function(req, res) {
+        proxy.web(req, res, {
+          target: 'ws://127.0.0.1:' + ports.source
+        },function(e){
+          if (e) done(e);
+        });
+      });
+
+      server.on('upgrade',function(req,res){
+        proxy.ws(req, res, {
+          target: 'ws://127.0.0.1:' + ports.source
+        },function(e){
+          if (e) done(e);
+        });
+      });
+
+      server.listen(ports.proxy);
+
+      var targetServer = http.createServer(),
+      destiny = io.listen(targetServer);
+
+      function startSocketIo() {
+        var client = ioClient.connect('ws://127.0.0.1:' + ports.proxy);
+
+        client.on('connect', async () => {
+          await delay(5000);
+          client.emit('incoming', 'hello there');
+        });
+
+        client.on('outgoing', function (data) {
+          expect(data).to.be('Hello over websockets');
+          server.close();
+          targetServer.close();
+          done();
+        });
+      }
+      targetServer.listen(ports.source);
+      server.on('listening', startSocketIo);
+
+      destiny.sockets.on('connection', function (socket) {
+        socket.on('incoming', function (msg) {
+          expect(msg).to.be('HELLO THERE');
+          socket.emit('outgoing', 'Hello over websockets');
+        });
+      });
+    });
 
     it('should emit open and close events when socket.io client connects and disconnects', function (done) {
       var ports = { source: gen.port, proxy: gen.port };
